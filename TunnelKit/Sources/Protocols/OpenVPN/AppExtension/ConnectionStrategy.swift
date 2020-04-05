@@ -41,25 +41,61 @@ import SwiftyBeaver
 private let log = SwiftyBeaver.self
 
 class ConnectionStrategy {
+    struct Endpoint: CustomStringConvertible {
+        let record: DNSRecord
+        
+        let proto: EndpointProtocol
+        
+        // MARK: CustomStringConvertible
+
+        var description: String {
+            return "\(record.address.maskedDescription):\(proto)"
+        }
+    }
+
+    struct EndpointIndex {
+        var recordIndex: Int
+        
+        var protocolIndex: Int
+        
+        mutating func advance(records: [DNSRecord], protos: [EndpointProtocol]) -> Bool {
+            protocolIndex += 1
+            guard protocolIndex < protos.count else {
+                recordIndex += 1
+                guard recordIndex < records.count else {
+                    return false
+                }
+                protocolIndex = 0
+                return true
+            }
+            return true
+        }
+    }
+
     private let hostname: String?
 
-    private let prefersResolvedAddresses: Bool
+    private var resolvedRecords: [DNSRecord]
 
-    private var resolvedAddresses: [String]?
-    
     private let endpointProtocols: [EndpointProtocol]
     
-    private var currentProtocolIndex = 0
+    private var currentEndpointIndex: EndpointIndex
 
     init(configuration: OpenVPNTunnelProvider.Configuration) {
         hostname = configuration.sessionConfiguration.hostname
-        prefersResolvedAddresses = (hostname == nil) || configuration.prefersResolvedAddresses
-        resolvedAddresses = configuration.resolvedAddresses
-        if prefersResolvedAddresses {
-            guard !(resolvedAddresses?.isEmpty ?? true) else {
-                fatalError("Either hostname or resolved addresses provided")
+        if hostname == nil || configuration.prefersResolvedAddresses {
+            guard let resolvedAddresses = configuration.resolvedAddresses, !resolvedAddresses.isEmpty else {
+                fatalError("Either hostname or configuration.resolvedAddresses required")
             }
+            resolvedRecords = resolvedAddresses.map { DNSRecord(address: $0, isIPv6: false) }
+        } else {
+
+            // will rely on DNS (requires hostname)
+            guard let _ = hostname else {
+                fatalError("Hostname is required")
+            }
+            resolvedRecords = []
         }
+
         guard var endpointProtocols = configuration.sessionConfiguration.endpointProtocols else {
             fatalError("No endpoints provided")
         }
@@ -67,101 +103,107 @@ class ConnectionStrategy {
             endpointProtocols.shuffle()
         }
         self.endpointProtocols = endpointProtocols
+        
+        currentEndpointIndex = EndpointIndex(recordIndex: 0, protocolIndex: 0)
+        skipToValidEndpoint()
+    }
+    
+    private func skipToValidEndpoint() {
+        guard !resolvedRecords.isEmpty else {
+            return
+        }
+        while !isCurrentEndpointValid() {
+            guard tryNextEndpoint() else {
+                return
+            }
+        }
     }
 
+    @discardableResult
+    func tryNextEndpoint() -> Bool {
+        repeat {
+            guard currentEndpointIndex.advance(records: resolvedRecords, protos: endpointProtocols) else {
+                return false
+            }
+        } while !isCurrentEndpointValid()
+        log.debug("Try next endpoint: \(currentEndpoint()!)")
+        return true
+    }
+    
+    func currentEndpoint() -> Endpoint? {
+        guard currentEndpointIndex.recordIndex < resolvedRecords.count, currentEndpointIndex.protocolIndex < endpointProtocols.count else {
+            return nil
+        }
+        let record = resolvedRecords[currentEndpointIndex.recordIndex]
+        let proto = endpointProtocols[currentEndpointIndex.protocolIndex]
+        return Endpoint(record: record, proto: proto)
+    }
+
+    private func isCurrentEndpointValid() -> Bool {
+        guard let endpoint = currentEndpoint() else {
+            return false
+        }
+        if endpoint.record.isIPv6 {
+            return endpoint.proto.socketType != .udp4 && endpoint.proto.socketType != .tcp4
+        } else {
+            return endpoint.proto.socketType != .udp6 && endpoint.proto.socketType != .tcp6
+        }
+    }
+    
     func createSocket(
         from provider: NEProvider,
         timeout: Int,
-        preferredAddress: String? = nil,
         queue: DispatchQueue,
         completionHandler: @escaping (GenericSocket?, Error?) -> Void) {
-        
-        // reuse preferred address
-        if let preferredAddress = preferredAddress {
-            log.debug("Pick preferred address: \(preferredAddress.maskedDescription)")
-            let socket = provider.createSocket(to: preferredAddress, protocol: currentProtocol())
+
+        if let endpoint = currentEndpoint() {
+            log.debug("Pick available endpoint: \(endpoint)")
+            let socket = provider.createSocket(to: endpoint)
             completionHandler(socket, nil)
             return
         }
-        
-        // use any resolved address
-        if prefersResolvedAddresses, let resolvedAddress = anyResolvedAddress() {
-            log.debug("Pick resolved address: \(resolvedAddress.maskedDescription)")
-            let socket = provider.createSocket(to: resolvedAddress, protocol: currentProtocol())
-            completionHandler(socket, nil)
-            return
-        }
-        
-        // fall back to DNS
+        log.debug("No address available, will resort to DNS resolution")
+
         guard let hostname = hostname else {
             log.error("DNS resolution unavailable: no hostname provided!")
             completionHandler(nil, OpenVPNTunnelProvider.ProviderError.dnsFailure)
             return
         }
         log.debug("DNS resolve hostname: \(hostname.maskedDescription)")
-        DNSResolver.resolve(hostname, timeout: timeout, queue: queue) { (addresses, error) in
-            
-            // refresh resolved addresses
-            if let resolved = addresses, !resolved.isEmpty {
-                self.resolvedAddresses = resolved
-
-                log.debug("DNS resolved addresses: \(resolved.map { $0.maskedDescription })")
+        DNSResolver.resolve(hostname, timeout: timeout, queue: queue) { (records, error) in
+            if let records = records, !records.isEmpty {
+                self.resolvedRecords = records
+                log.debug("DNS resolved addresses: \(records.map { $0.address })")
             } else {
                 log.error("DNS resolution failed!")
             }
+            
+            // prepare initial endpoint
+            self.skipToValidEndpoint()
 
-            guard let targetAddress = self.resolvedAddress(from: addresses) else {
-                log.error("No resolved or fallback address available")
+            guard let targetEndpoint = self.currentEndpoint() else {
+                log.error("No DNS or pre-resolved address available")
                 completionHandler(nil, OpenVPNTunnelProvider.ProviderError.dnsFailure)
                 return
             }
 
-            let socket = provider.createSocket(to: targetAddress, protocol: self.currentProtocol())
+            log.debug("Pick resolved endpoint: \(targetEndpoint)")
+            let socket = provider.createSocket(to: targetEndpoint)
             completionHandler(socket, nil)
         }
-    }
-
-    func tryNextProtocol() -> Bool {
-        let next = currentProtocolIndex + 1
-        guard next < endpointProtocols.count else {
-            log.debug("No more protocols available")
-            return false
-        }
-        currentProtocolIndex = next
-        log.debug("Fall back to next protocol: \(currentProtocol())")
-        return true
-    }
-    
-    private func currentProtocol() -> EndpointProtocol {
-        return endpointProtocols[currentProtocolIndex]
-    }
-
-    private func resolvedAddress(from addresses: [String]?) -> String? {
-        guard let resolved = addresses, !resolved.isEmpty else {
-            return anyResolvedAddress()
-        }
-        return resolved[0]
-    }
-
-    private func anyResolvedAddress() -> String? {
-        guard let addresses = resolvedAddresses, !addresses.isEmpty else {
-            return nil
-        }
-        let n = Int(arc4random() % UInt32(addresses.count))
-        return addresses[n]
     }
 }
 
 private extension NEProvider {
-    func createSocket(to address: String, protocol endpointProtocol: EndpointProtocol) -> GenericSocket {
-        let endpoint = NWHostEndpoint(hostname: address, port: "\(endpointProtocol.port)")
-        switch endpointProtocol.socketType {
+    func createSocket(to endpoint: ConnectionStrategy.Endpoint) -> GenericSocket {
+        let ep = NWHostEndpoint(hostname: endpoint.record.address, port: "\(endpoint.proto.port)")
+        switch endpoint.proto.socketType {
         case .udp, .udp4, .udp6:
-            let impl = createUDPSession(to: endpoint, from: nil)
+            let impl = createUDPSession(to: ep, from: nil)
             return NEUDPSocket(impl: impl)
             
         case .tcp, .tcp4, .tcp6:
-            let impl = createTCPConnection(to: endpoint, enableTLS: false, tlsParameters: nil, delegate: nil)
+            let impl = createTCPConnection(to: ep, enableTLS: false, tlsParameters: nil, delegate: nil)
             return NETCPSocket(impl: impl)
         }
     }

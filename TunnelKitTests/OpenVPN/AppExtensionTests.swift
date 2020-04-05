@@ -106,4 +106,40 @@ class AppExtensionTests: XCTestCase {
         }
         waitForExpectations(timeout: 5.0, handler: nil)
     }
+    
+    func testEndpointCycling() {
+        CoreConfiguration.masksPrivateData = false
+        
+        var builder1 = OpenVPN.ConfigurationBuilder()
+        builder1.hostname = "italy.privateinternetaccess.com"
+        builder1.endpointProtocols = [
+            EndpointProtocol(.tcp6, 2222),
+            EndpointProtocol(.udp, 1111),
+            EndpointProtocol(.udp4, 3333)
+        ]
+        var builder2 = OpenVPNTunnelProvider.ConfigurationBuilder(sessionConfiguration: builder1.build())
+        builder2.prefersResolvedAddresses = false
+        builder2.resolvedAddresses = [
+            "82.102.21.218",
+            "82.102.21.214",
+            "82.102.21.213"
+        ]
+        let strategy = ConnectionStrategy(configuration: builder2.build())
+        
+        let expected = [
+            "82.102.21.218:UDP:1111",
+            "82.102.21.218:UDP4:3333",
+            "82.102.21.214:UDP:1111",
+            "82.102.21.214:UDP4:3333",
+            "82.102.21.213:UDP:1111",
+            "82.102.21.213:UDP4:3333",
+        ]
+        var i = 0
+        while let endpoint = strategy.currentEndpoint() {
+            print("\(endpoint)")
+            XCTAssertEqual(endpoint.description, expected[i])
+            i += 1
+            strategy.tryNextEndpoint()
+        }
+    }
 }
