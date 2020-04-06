@@ -162,7 +162,7 @@ class ConnectionStrategy {
             completionHandler(socket, nil)
             return
         }
-        log.debug("No address available, will resort to DNS resolution")
+        log.debug("No endpoints available, will resort to DNS resolution")
 
         guard let hostname = hostname else {
             log.error("DNS resolution unavailable: no hostname provided!")
@@ -182,7 +182,7 @@ class ConnectionStrategy {
             self.skipToValidEndpoint()
 
             guard let targetEndpoint = self.currentEndpoint() else {
-                log.error("No DNS or pre-resolved address available")
+                log.error("No endpoints available")
                 completionHandler(nil, OpenVPNTunnelProvider.ProviderError.dnsFailure)
                 return
             }
