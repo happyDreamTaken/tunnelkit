@@ -70,6 +70,11 @@ class ConnectionStrategy {
             }
             return true
         }
+
+        mutating func reset() {
+            recordIndex = 0
+            protocolIndex = 0
+        }
     }
 
     private let hostname: String?
@@ -82,16 +87,11 @@ class ConnectionStrategy {
 
     init(configuration: OpenVPNTunnelProvider.Configuration) {
         hostname = configuration.sessionConfiguration.hostname
-        if hostname == nil || configuration.prefersResolvedAddresses {
-            guard let resolvedAddresses = configuration.resolvedAddresses, !resolvedAddresses.isEmpty else {
-                fatalError("Either hostname or configuration.resolvedAddresses required")
-            }
+        if let resolvedAddresses = configuration.resolvedAddresses, !resolvedAddresses.isEmpty {
             resolvedRecords = resolvedAddresses.map { DNSRecord(address: $0, isIPv6: false) }
         } else {
-
-            // will rely on DNS (requires hostname)
-            guard let _ = hostname else {
-                fatalError("Hostname is required")
+            guard hostname != nil else {
+                fatalError("Either hostname or configuration.resolvedAddresses required")
             }
             resolvedRecords = []
         }
@@ -173,6 +173,7 @@ class ConnectionStrategy {
         DNSResolver.resolve(hostname, timeout: timeout, queue: queue) { (records, error) in
             if let records = records, !records.isEmpty {
                 self.resolvedRecords = records
+                self.currentEndpointIndex.reset()
                 log.debug("DNS resolved addresses: \(records.map { $0.address })")
             } else {
                 log.error("DNS resolution failed!")
